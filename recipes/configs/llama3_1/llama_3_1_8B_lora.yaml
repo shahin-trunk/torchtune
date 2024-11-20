@@ -177,8 +177,8 @@ loss:
 # Training
 epochs: 1
 max_steps_per_epoch: null
-gradient_accumulation_steps: 8  # Use to increase virtual batch size
-compile: False  # pytorch compile, set to true for better perf/memory
+gradient_accumulation_steps: 32  # Use to increase virtual batch size
+compile: True  # pytorch compile, set to true for better perf/memory
 
 # Logging
 output_dir: /workspace/models/expmt/v3/lora_3_1_8B_finetune_output
