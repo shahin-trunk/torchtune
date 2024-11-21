@@ -19,7 +19,6 @@ def __filer_fn(example: Optional[Dict]) -> bool:
     skip = True
     if example and example is not None:
         keys = example.keys()
-        print(f"keys: {keys}")
         if 'instruction' in keys and 'input' in keys and 'output' in keys:
             skip = False
 
