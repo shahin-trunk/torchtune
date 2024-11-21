@@ -18,18 +18,11 @@ from torchtune.modules.tokenizers import ModelTokenizer
 def __filer_fn(example: Optional[Dict]) -> bool:
     skip = True
     if example and example is not None:
-        keys = example.keys()
-        if ('instruction' in keys
-                and 'input' in keys
-                and 'output' in keys
-                and example['instruction'] is not None
-                and example['input'] is not None
-                and example['output'] is not None
-                and isinstance(example['instruction'], str)
-                and isinstance(example['input'], str)
-                and isinstance(example['output'], str)):
-            skip = False
-
+        skip = False
+        for key in example.keys():
+            if not isinstance(key, str) or example[key] is None or not isinstance(example[key], str):
+                skip = True
+                break
     if skip:
         print(f"Skipping sample: {example}")
 

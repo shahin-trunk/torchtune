@@ -7,8 +7,8 @@ m_tokenizer = Llama3Tokenizer(path="/workspace/models/Meta-Llama-3.1-70B-Instruc
 datasets = {
     # "arbml/CIDAR": instruct_dataset(tokenizer=m_tokenizer, source="arbml/CIDAR",
     #                                 column_map={"input": "instruction", "output": "output"}),
-    # "akbargherbal/six_millions_instruction_dataset_for_arabic_llm_ft": alpaca_dataset(tokenizer=m_tokenizer,
-    #                                                                                   source="akbargherbal/six_millions_instruction_dataset_for_arabic_llm_ft"),
+    "akbargherbal/six_millions_instruction_dataset_for_arabic_llm_ft": alpaca_inception_dataset(tokenizer=m_tokenizer,
+                                                                                                source="akbargherbal/six_millions_instruction_dataset_for_arabic_llm_ft"),
     # "akbargherbal/hadith_alpaca_ft": alpaca_dataset(tokenizer=m_tokenizer,
     #                                                 source="akbargherbal/hadith_alpaca_ft"),
     # "akbargherbal/ONE_MILLION_AR_TO_EN_SENTENCES_DATASET": alpaca_dataset(tokenizer=m_tokenizer,
