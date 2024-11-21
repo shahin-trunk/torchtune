@@ -14,18 +14,14 @@ from torchtune.datasets._packed import PackedDataset
 from torchtune.datasets._sft import SFTDataset
 from torchtune.modules.tokenizers import ModelTokenizer
 
-__BLANK = ""
-
 
 def __filer_fn(example: Optional[Dict]) -> bool:
     skip = True
     if example and example is not None:
-        skip = False
-        for k, v in example.items():
-            print(f"k: {k}, v: {v}")
-            if k is None or v is None or str(k).strip() == __BLANK or str(v).strip() == __BLANK:
-                skip = True
-                break
+        keys = example.keys()
+        print(f"keys: {keys}")
+        if 'instruction' in keys and 'input' in keys and 'output' in keys:
+            skip = False
 
     if skip:
         print(f"Skipping sample: {example}")
