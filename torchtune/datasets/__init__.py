@@ -29,6 +29,7 @@ from torchtune.datasets._inception import inc_ar_hc3, inc_ar_botim_qa, inc_ar_al
     inc_ar_raft, inc_ar_school_hack, inc_ar_en_school_hack
 
 from torchtune.datasets._alpaca_inception import alpaca_inception_dataset
+from torchtune.datasets._instruct_inception import instruct_inception_dataset
 
 __all__ = [
     "alpaca_dataset",
@@ -39,6 +40,7 @@ __all__ = [
     "stack_exchange_paired_dataset",
     "slimorca_dataset",
     "instruct_dataset",
+    "instruct_inception_dataset",
     "preference_dataset",
     "chat_dataset",
     "text_completion_dataset",
