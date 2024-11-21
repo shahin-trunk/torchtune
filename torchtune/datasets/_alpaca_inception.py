@@ -22,6 +22,7 @@ def __filer_fn(example: Optional[Dict]) -> bool:
     if example and example is not None:
         skip = False
         for k, v in example.items():
+            print(f"k: {k}, v: {v}")
             if k is None or v is None or str(k).strip() == __BLANK or str(v).strip() == __BLANK:
                 skip = True
                 break
