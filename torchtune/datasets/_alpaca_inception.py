@@ -14,19 +14,28 @@ from torchtune.datasets._packed import PackedDataset
 from torchtune.datasets._sft import SFTDataset
 from torchtune.modules.tokenizers import ModelTokenizer
 
+__DEFAULT_COLUMNS = ['instruction', 'input', 'output']
 
-def __filer_fn(example: Optional[Dict]) -> bool:
-    skip = True
-    if example and example is not None:
-        skip = False
-        for key in example.keys():
-            if not isinstance(key, str) or example[key] is None or not isinstance(example[key], str):
-                skip = True
-                break
-    if skip:
-        print(f"Skipping sample: {example}")
 
-    return not skip
+def __get_filter_fn(column_map: Dict):
+    column_names = column_map.values() if column_map else __DEFAULT_COLUMNS
+
+    def __filer_fn(example: Optional[Dict]) -> bool:
+        skip = True
+        if example and example is not None:
+            skip = False
+            for key in example.keys():
+                if key not in column_names:
+                    continue
+                if not isinstance(key, str) or example[key] is None or not isinstance(example[key], str):
+                    skip = True
+                    break
+        if skip:
+            print(f"Skipping sample: {example}")
+
+        return not skip
+
+    return __filer_fn
 
 
 def alpaca_inception_dataset(
@@ -94,7 +103,7 @@ def alpaca_inception_dataset(
     )
 
     if filter_fn is None:
-        filter_fn = __filer_fn
+        filter_fn = __get_filter_fn(column_map)
 
     ds = SFTDataset(
         source=source,
