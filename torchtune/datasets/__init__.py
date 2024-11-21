@@ -28,8 +28,11 @@ from torchtune.datasets._inception import inc_ar_hc3, inc_ar_botim_qa, inc_ar_al
     inc_ar_unnatural, inc_ar_cahya, inc_ar_climate_chatgpt, inc_ar_instruct_wild, inc_ar_lmsys, inc_ar_bactrian, \
     inc_ar_raft, inc_ar_school_hack, inc_ar_en_school_hack
 
+from torchtune.datasets._alpaca_inception import alpaca_inception_dataset
+
 __all__ = [
     "alpaca_dataset",
+    "alpaca_inception_dataset",
     "alpaca_cleaned_dataset",
     "grammar_dataset",
     "samsum_dataset",

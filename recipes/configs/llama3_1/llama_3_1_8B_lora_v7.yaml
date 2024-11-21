@@ -43,10 +43,10 @@ checkpointer:
     model-00004-of-00004.safetensors
   ]
   recipe_checkpoint: null
-  output_dir: /workspace/models/expmt/v5/Meta-Llama-3.1-8B-Instruct/
+  output_dir: /workspace/models/expmt/v7/Meta-Llama-3.1-8B-Instruct/
   model_type: LLAMA3
 resume_from_checkpoint: False
-save_adapter_weights_only: False
+save_adapter_weights_only: True
 
 # Dataset and Sampler
 dataset:
@@ -181,7 +181,7 @@ gradient_accumulation_steps: 16  # Use to increase virtual batch size
 compile: True  # pytorch compile, set to true for better perf/memory
 
 # Logging
-output_dir: /workspace/models/expmt/v5/lora_llama_3_1_8B
+output_dir: /workspace/models/expmt/v7/lora_llama_3_1_8B
 metric_logger:
   _component_: torchtune.training.metric_logging.DiskLogger
   log_dir: ${output_dir}
