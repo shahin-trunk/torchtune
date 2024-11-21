@@ -16,20 +16,6 @@ STAR = "*"
 BLANK = ""
 
 
-def __filer_fn(example: Optional[Dict]) -> bool:
-    skip = True
-    if example and example is not None:
-        skip = False
-        for key in example.keys():
-            if not isinstance(key, str) or example[key] is None or not isinstance(example[key], str):
-                skip = True
-                break
-    if skip:
-        print(f"Skipping sample: {example}")
-
-    return not skip
-
-
 class __InceptionToMessages(Transform):
 
     def __init__(self, train_on_input: bool = True, column_map: Optional[Dict[str, str]] = None) -> None:
@@ -144,9 +130,6 @@ def __inception_base(
     message_transform = __InceptionToMessages(
         train_on_input=train_on_input, column_map=column_map
     )
-
-    if filter_fn is None:
-        filter_fn = __filer_fn
 
     ds = SFTDataset(
         source=source,
