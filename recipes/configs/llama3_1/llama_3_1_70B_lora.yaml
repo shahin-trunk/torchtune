@@ -102,14 +102,14 @@ dataset:
     packed: False  # True increases speed
   - _component_: torchtune.datasets.inc_ar_en_school_hack
     packed: False  # True increases speed
-  - _component_: torchtune.datasets.instruct_dataset
+  - _component_: torchtune.datasets.instruct_inception_dataset
     packed: False  # True increases speed
     source: arbml/CIDAR
     column_map:
       input: instruction
       output: output
     split: train
-  - _component_: torchtune.datasets.alpaca_dataset
+  - _component_: torchtune.datasets.alpaca_inception_dataset
     packed: False  # True increases speed
     source: akbargherbal/six_millions_instruction_dataset_for_arabic_llm_ft
     column_map:
@@ -117,7 +117,7 @@ dataset:
       output: output
       instruction: instruction
     split: train
-  - _component_: torchtune.datasets.alpaca_dataset
+  - _component_: torchtune.datasets.alpaca_inception_dataset
     packed: False  # True increases speed
     source: akbargherbal/hadith_alpaca_ft
     column_map:
@@ -125,7 +125,7 @@ dataset:
       output: output
       instruction: instruction
     split: train
-  - _component_: torchtune.datasets.alpaca_dataset
+  - _component_: torchtune.datasets.alpaca_inception_dataset
     packed: False  # True increases speed
     source: akbargherbal/ONE_MILLION_AR_TO_EN_SENTENCES_DATASET
     column_map:
@@ -133,7 +133,7 @@ dataset:
       output: output
       instruction: instruction
     split: train
-  - _component_: torchtune.datasets.alpaca_dataset
+  - _component_: torchtune.datasets.alpaca_inception_dataset
     packed: False  # True increases speed
     source: akbargherbal/10K_english_to_arabic_dataset_for_FT
     column_map:
@@ -141,7 +141,7 @@ dataset:
       output: output
       instruction: instruction
     split: train
-  - _component_: torchtune.datasets.alpaca_dataset
+  - _component_: torchtune.datasets.alpaca_inception_dataset
     packed: False  # True increases speed
     source: akbargherbal/10K_ARABIC_POEMS_FOR_FINETUNING
     column_map:
@@ -149,7 +149,7 @@ dataset:
       output: output
       instruction: system
     split: train
-  - _component_: torchtune.datasets.alpaca_dataset
+  - _component_: torchtune.datasets.alpaca_inception_dataset
     packed: False  # True increases speed
     source: akbargherbal/cohere_msa_arabic_dataset
     column_map:
@@ -157,7 +157,7 @@ dataset:
       output: output
       instruction: instruction
     split: train
-  - _component_: torchtune.datasets.alpaca_dataset
+  - _component_: torchtune.datasets.alpaca_inception_dataset
     packed: False  # True increases speed
     source: akbargherbal/ONE_MILLION_EN_TO_AR_SENTENCES_DATASET
     column_map:
@@ -165,7 +165,7 @@ dataset:
       output: output
       instruction: instruction
     split: train
-  - _component_: torchtune.datasets.alpaca_dataset
+  - _component_: torchtune.datasets.alpaca_inception_dataset
     packed: False  # True increases speed
     source: AhmedBou/Arabic_instruction_dataset_for_llm_ft
     column_map:
@@ -193,7 +193,7 @@ loss:
 # Training
 epochs: 1
 max_steps_per_epoch: null
-gradient_accumulation_steps: 32  # Use to increase virtual batch size
+gradient_accumulation_steps: 8  # Use to increase virtual batch size
 compile: True  # pytorch compile, set to true for better perf/memory
 
 # Logging
@@ -208,7 +208,7 @@ log_peak_memory_stats: True
 device: cuda
 dtype: bf16
 enable_activation_checkpointing: True  # True reduces memory
-enable_activation_offloading: False  # True reduces memory
+enable_activation_offloading: True  # True reduces memory
 
 # Profiler (disabled)
 profiler:
