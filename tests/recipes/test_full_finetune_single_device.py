@@ -29,6 +29,12 @@ from tests.test_utils import (
     TOKENIZER_PATHS,
 )
 
+from torchtune.training.checkpointing._utils import (
+    get_largest_iter_folder,
+    RECIPE_STATE_DIRNAME,
+    SHARD_FNAME,
+)
+
 
 class TestFullFinetuneSingleDeviceRecipe:
     def _get_test_config_overrides(self):
@@ -50,8 +56,8 @@ class TestFullFinetuneSingleDeviceRecipe:
 
     def _fetch_expected_loss_values(self, model_type):
         loss_values_map = {
-            "llama2": [10.5201, 10.5217, 10.4945, 10.5136],
-            "llama3": [11.9839, 11.9684, 11.9596, 11.9366],
+            "llama2": [10.5219, 10.5292, 10.5475, 10.5195],
+            "llama3": [11.9611, 11.9432, 11.9326, 11.9807],
         }
 
         return loss_values_map[model_type]
@@ -131,7 +137,11 @@ class TestFullFinetuneSingleDeviceRecipe:
         )
 
     @pytest.mark.integration_test
-    def test_training_state_on_resume(self, tmpdir, monkeypatch):
+    @pytest.mark.parametrize(
+        "optimizer_in_bwd",
+        [True, False],
+    )
+    def test_training_state_on_resume(self, tmpdir, monkeypatch, optimizer_in_bwd):
         """Test whether the recipe state is correctly updated on resume. Since this
         is model agnostic, we should run this on the small model only. The test
         consists of three stages:
@@ -143,7 +153,7 @@ class TestFullFinetuneSingleDeviceRecipe:
         ckpt = "llama2_hf"
         ckpt_path = Path(CKPT_MODEL_PATHS[ckpt])
         ckpt_dir = ckpt_path.parent
-        log_file = gen_log_file_name(tmpdir)
+        first_log_file = gen_log_file_name(tmpdir, suffix="first")
 
         # Config file needed for model conversion.
         # Create a second copy for training resume
@@ -163,6 +173,8 @@ class TestFullFinetuneSingleDeviceRecipe:
             checkpointer.model_type=LLAMA2 \
             tokenizer.path=/tmp/test-artifacts/tokenizer.model \
             tokenizer.prompt_template=null \
+            metric_logger.filename={first_log_file} \
+            optimizer_in_bwd={optimizer_in_bwd} \
         """.split()
 
         model_config = MODEL_TEST_CONFIGS["llama2"]
@@ -172,22 +184,37 @@ class TestFullFinetuneSingleDeviceRecipe:
         with pytest.raises(SystemExit, match=""):
             runpy.run_path(TUNE_PATH, run_name="__main__")
 
+        # Sanity check that the loss values are expected for the initial run
+        expected_loss_values = self._fetch_expected_loss_values("llama2")
+        loss_values = get_loss_values_from_metric_logger(first_log_file)
+        torch.testing.assert_close(
+            loss_values, expected_loss_values, rtol=1e-4, atol=1e-4
+        )
+
         # Resume training
+        log_file = gen_log_file_name(tmpdir, suffix="resume")
+        epoch_folder = get_largest_iter_folder(tmpdir)
+        epoch_folder_minus_one = f"epoch_{int(epoch_folder.split('_')[-1]) - 1}"
+        suffix = ".safetensors"
+        model_ckpt_fname = (
+            SHARD_FNAME.format(cpt_idx="1".zfill(5), num_shards="1".zfill(5)) + suffix
+        )
         cmd_2 = f"""
         tune run full_finetune_single_device \
             --config llama2/7B_full_low_memory \
             batch_size=8 \
             output_dir={tmpdir} \
             checkpointer._component_=torchtune.training.FullModelHFCheckpointer \
-            checkpointer.checkpoint_dir={tmpdir} \
-            checkpointer.checkpoint_files=[{os.path.join(tmpdir, "hf_model_0001_0.pt")}]\
-            checkpointer.recipe_checkpoint={os.path.join(tmpdir, "recipe_state.pt")}\
+            checkpointer.checkpoint_dir={ckpt_dir} \
+            checkpointer.checkpoint_files=[{os.path.join(epoch_folder_minus_one, model_ckpt_fname)}]\
+            checkpointer.recipe_checkpoint={os.path.join(RECIPE_STATE_DIRNAME, "recipe_state.pt")}\
             checkpointer.output_dir={tmpdir} \
             checkpointer.model_type=LLAMA2 \
             tokenizer.path=/tmp/test-artifacts/tokenizer.model \
             tokenizer.prompt_template=null \
             resume_from_checkpoint=True \
             metric_logger.filename={log_file} \
+            optimizer_in_bwd={optimizer_in_bwd} \
         """.split()
 
         cmd_2 = cmd_2 + self._get_test_config_overrides() + model_config

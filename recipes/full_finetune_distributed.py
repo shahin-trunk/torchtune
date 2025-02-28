@@ -8,17 +8,23 @@ import sys
 import time
 
 from functools import partial
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Union
 from warnings import warn
 
 import torch
 from omegaconf import DictConfig, ListConfig
 
 from torch import nn
-from torch.distributed import destroy_process_group, init_process_group
-
+from torch.distributed import (
+    destroy_process_group,
+    init_device_mesh,
+    init_process_group,
+)
+from torch.distributed._tensor import DTensor
+from torch.distributed.tensor.parallel import parallelize_module
 from torch.optim import Optimizer
-from torch.utils.data import DataLoader, DistributedSampler
+from torchdata.stateful_dataloader import StatefulDataLoader
+from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
 from torchtune import config, modules, training, utils
 from torchtune.config._utils import _get_component_from_path
 from torchtune.data import padded_collate_packed
@@ -26,6 +32,10 @@ from torchtune.datasets import ConcatDataset
 from torchtune.recipe_interfaces import FTRecipeInterface
 from torchtune.training import DummyProfiler, PROFILER_KEY
 from torchtune.training.activations import apply_selective_activation_checkpointing
+from torchtune.training.checkpointing._checkpoint_client import (
+    CheckpointClient,
+    TrainingProgress,
+)
 from torchtune.training.lr_schedulers import get_lr
 
 from tqdm import tqdm
@@ -114,7 +124,8 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
     """
 
     def __init__(self, cfg: DictConfig) -> None:
-        self._device = utils.get_device(device=cfg.device)
+        device_type = cfg.device
+        self._device = utils.get_device(device=device_type)
         self._dtype = training.get_dtype(cfg.dtype, device=self._device)
 
         if self._dtype == torch.float16:
@@ -122,36 +133,49 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                 "full fp16 training is not supported with this recipe. Please use bf16 or fp32 instead."
             )
 
-        if (
-            cfg.get("fsdp_cpu_offload", False)
-            and cfg.optimizer.get("fused", False)
-            and not utils.torch_version_ge("2.4.0")
-        ):
-            raise RuntimeError(
-                "Using fused optimizer on CPU is only supported in PyTorch nightly."
-            )
+        # Set up the backend for distributed training (NCCL, GLOO, etc.)
+        self._enable_async_checkpointing = cfg.get("enable_async_checkpointing", False)
+        self.fsdp_cpu_offload = cfg.get("fsdp_cpu_offload", False)
+        self.distributed_backend = training.get_distributed_backend(
+            device_type,
+            offload_ops_to_cpu=self.fsdp_cpu_offload
+            or self._enable_async_checkpointing,
+        )
+        init_process_group(self.distributed_backend)
 
-        # logging attributes
+        # Initialize distributed variables
+        self.world_size, self.rank = utils.get_world_size_and_rank()
+        self._is_rank_zero = self.rank == 0
+        self.tensor_parallel_plan = config.instantiate(
+            cfg.get("tensor_parallel_plan", None)
+        )
+        self.tensor_parallel_dim = cfg.get("tensor_parallel_dim", 1)
+        if self.tensor_parallel_dim > 1 and self.tensor_parallel_plan is None:
+            raise ValueError(
+                "Tensor Parallel plan needs to be provided when tensor parallel is enabled."
+            )
+        if self.world_size % self.tensor_parallel_dim != 0:
+            raise ValueError(
+                f"world_size {self.world_size} must be divisible by tensor_parallel_dim {self.tensor_parallel_dim}"
+            )
+        self.data_parallel_dim = self.world_size // self.tensor_parallel_dim
+
+        # Logging attributes
         self._output_dir = cfg.output_dir
         self._log_every_n_steps = cfg.get("log_every_n_steps", 1)
         self._log_peak_memory_stats = cfg.get("log_peak_memory_stats", False)
-
-        if self._log_peak_memory_stats and self._device.type != "cuda":
+        if self._log_peak_memory_stats and device_type != "cuda":
             log.info(
                 "log_peak_memory_stats was set to True, however, training does not use cuda. Setting log_peak_memory_stats=False."
             )
             self._log_peak_memory_stats = False
-
-        # _is_rank_zero is used primarily for logging. In the future, the logger
-        # should directly take care of this
-        _, rank = training.get_world_size_and_rank()
-        self._is_rank_zero = rank == 0
 
         # Training cfg
         self._resume_from_checkpoint = cfg.resume_from_checkpoint
         self._gradient_accumulation_steps = cfg.gradient_accumulation_steps
         self._optimizer_in_bwd = cfg.get("optimizer_in_bwd", False)
         self._clip_grad_norm = cfg.get("clip_grad_norm", None)
+        self._checkpoint_client = CheckpointClient(cfg)
 
         # Optimizer in backward is not compatible with gradient accumulation or gradient clipping
         if self._optimizer_in_bwd:
@@ -174,7 +198,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
             "enable_activation_offloading", False
         )
         if self._enable_activation_offloading:
-            if self._device.type != "cuda":
+            if device_type != "cuda":
                 raise RuntimeError(
                     "enable_activation_offloading should only be True when training on CUDA"
                 )
@@ -194,26 +218,13 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
 
         # These are public properties which are updated by the checkpoint loader
         # when ``resume_from_checkpoint`` is `True` or validated in tests
-        self.seed = training.set_seed(seed=cfg.seed)
+        self.seed = training.set_seed(
+            seed=cfg.seed, debug_mode=cfg.get("cudnn_deterministic_mode", None)
+        )
         self.epochs_run = 0
         self.total_epochs = cfg.epochs
         self.max_steps_per_epoch = cfg.max_steps_per_epoch
         self.global_step = 0
-
-    def load_checkpoint(self, cfg_checkpointer: DictConfig) -> Dict[str, Any]:
-        """
-        Extract the checkpoint state from file and validate. If resume_from_checkpoint
-        is True, this also includes the recipe state.
-        """
-        self._checkpointer = config.instantiate(
-            cfg_checkpointer,
-            resume_from_checkpoint=self._resume_from_checkpoint,
-        )
-        checkpoint_dict = self._checkpointer.load_checkpoint()
-
-        if self._resume_from_checkpoint:
-            self._update_recipe_state(checkpoint_dict)
-        return checkpoint_dict
 
     def _update_recipe_state(self, ckpt_dict: Dict[str, Any]) -> None:
         """
@@ -258,15 +269,20 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
     def setup(self, cfg: DictConfig) -> None:
         """
         Setup the recipe. This includes training state (if resume_from_checkpoint is True),
-        model, tokenizer, loss, optimizer, sampler, and dataloader.
+        model, tokenizer, loss, optimizer, lr scheduler, sampler, and dataloader.
         """
+        if self.fsdp_cpu_offload:
+            # Utilize all available CPU cores for intra-op parallelism. This provides ~2x
+            # speed up when benchmarking fused AdamW on CPU
+            training.set_torch_num_threads()
+
         if self._is_rank_zero:
             self._metric_logger = config.instantiate(cfg.metric_logger)
-
             # log config with parameter override
             self._metric_logger.log_config(cfg)
 
-        checkpoint_dict = self.load_checkpoint(cfg_checkpointer=cfg.checkpointer)
+        # Load the base model
+        checkpoint_dict = self._checkpoint_client.load_base_checkpoint()
 
         self._compile = cfg.get("compile", False)
         self._model = self._setup_model(
@@ -274,7 +290,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
             enable_activation_checkpointing=self._enable_activation_checkpointing,
             enable_activation_offloading=self._enable_activation_offloading,
             custom_sharded_layers=cfg.get("custom_sharded_layers", None),
-            fsdp_cpu_offload=cfg.get("fsdp_cpu_offload", False),
+            fsdp_cpu_offload=self.fsdp_cpu_offload,
             reshard_after_forward=cfg.get("fsdp_reshard_after_forward", True),
             model_state_dict=checkpoint_dict[training.MODEL_KEY],
             ac_mode=cfg.get("ac_mode", None),
@@ -287,10 +303,35 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
             optimizer_in_bwd=self._optimizer_in_bwd,
             opt_state_dict=(
                 checkpoint_dict[training.OPT_KEY]
-                if self._resume_from_checkpoint
+                if training.OPT_KEY in checkpoint_dict
                 else None
             ),
         )
+
+        if self._resume_from_checkpoint:
+            # If async checkpointing is enabled, intermediate checkpoints are saved asynchronously
+            # using the DistributedCheckpointer.
+            # Therefore the recipe needs to load the distributed checkpoint to restore the training
+            # progress.
+            if self._enable_async_checkpointing:
+                try:
+                    checkpoint_dict = (
+                        self._checkpoint_client.load_distributed_checkpoint(
+                            self._model,
+                            (
+                                self._optim_ckpt_wrapper
+                                if self._optimizer_in_bwd
+                                else self._optimizer
+                            ),
+                        )
+                    )
+                except Exception as e:
+                    log.warning(
+                        f"Failed to load distributed checkpoint: {e}. Training will start from the base checkpoint."
+                    )
+
+            # Update the recipe state from the checkpoint state dict.
+            self._update_recipe_state(checkpoint_dict)
 
         # initialize loss
         self._loss_fn = config.instantiate(cfg.loss)
@@ -302,13 +343,12 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
             # set num_output_chunks for model
             self._model.set_num_output_chunks(self._loss_fn.num_output_chunks)
 
-        if self._is_rank_zero:
-            log.info("Loss is initialized.")
+        utils.log_rank_zero(log, "Loss is initialized.")
 
         # sampler and dataloader depend on the tokenizer and loss_fn and should be
         # setup after both of these are initialized
         collate_name = cfg.get("collate_fn", "torchtune.data.padded_collate_sft")
-        self._sampler, self._dataloader = self._setup_data(
+        self._dataloader = self._setup_data(
             cfg_dataset=cfg.dataset,
             shuffle=cfg.shuffle,
             batch_size=cfg.batch_size,
@@ -332,6 +372,13 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
             self._steps_per_epoch = self.max_steps_per_epoch
         self.global_step = self.epochs_run * self._steps_per_epoch
 
+        # Setup lr scheduler
+        self._lr_scheduler = self._setup_lr_scheduler(
+            cfg_lr_scheduler=cfg.get("lr_scheduler", None),
+            num_training_steps=self.total_epochs * self._steps_per_epoch,
+            last_epoch=self.global_step - 1,
+        )
+
         # Set up profiler, returns DummyProfiler (nullcontext object with no-op `step` method)
         # if cfg is missing profiler key or if `cfg.profiler.enabled = False`
         self._profiler = self._setup_profiler(cfg.get(PROFILER_KEY, None))
@@ -340,6 +387,55 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         self.ignore_labels_cache = torch.full(
             (cfg.batch_size, 1), self._loss_fn.ignore_index, device=self._device
         )
+
+    def _setup_lr_scheduler(
+        self,
+        cfg_lr_scheduler: Optional[DictConfig],
+        num_training_steps: int,
+        last_epoch: int,
+    ) -> Optional[Optimizer]:
+        """
+        Set up the learning rate scheduler based on the provided configuration.
+        It supports both standard optimization and optimizer-in-backward cases.
+
+        Args:
+            cfg_lr_scheduler (Optional[DictConfig]): The learning rate scheduler configuration.
+            num_training_steps (int): The total number of training steps.
+            last_epoch (int): The index of the last epoch.
+
+        Returns:
+            lr_scheduler (Optional[Optimizer]): The learning rate scheduler.
+        """
+        if cfg_lr_scheduler is None:
+            if self._is_rank_zero:
+                log.info(
+                    "No learning rate scheduler configured. Using constant learning rate."
+                )
+            return None
+
+        if self._optimizer_in_bwd:
+            # Use the first optimizer from the wrapper to represent the learning rate
+            optimizer = next(iter(self._optim_ckpt_wrapper.optim_map.values()))
+        else:
+            # Standard case: use the single optimizer
+            optimizer = self._optimizer
+
+        # Instantiate the learning rate scheduler
+        lr_scheduler = config.instantiate(
+            cfg_lr_scheduler,
+            optimizer,
+            num_training_steps=num_training_steps,
+            last_epoch=last_epoch,
+        )
+
+        if self._optimizer_in_bwd:
+            # Modify the scheduler for optimizer_in_bwd case
+            self._optim_ckpt_wrapper.set_lr_scheduler(lr_scheduler)
+
+        if self._is_rank_zero:
+            log.info("Learning rate scheduler is initialized.")
+
+        return lr_scheduler
 
     def _setup_profiler(
         self, cfg_profiler: Optional[DictConfig] = None
@@ -397,9 +493,10 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
 
         profiler, profiler_cfg = config.instantiate(cfg_profiler)
 
+        utils.log_rank_zero(
+            log, f" Profiler config after instantiation: {profiler_cfg}"
+        )
         if self._is_rank_zero:
-            log.info(f" Profiler config after instantiation: {profiler_cfg}")
-
             self.profiler_profile_memory = profiler_cfg.get("profile_memory", False)
             if profiler_cfg["enabled"]:
                 self.profiler_wait_steps = profiler_cfg["wait_steps"]
@@ -428,17 +525,35 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
               full state dicts are loaded with ``torch.load(mmap=True)``
         """
 
-        if self._is_rank_zero:
-            log.info(
-                "FSDP is enabled. Instantiating model and loading checkpoint on Rank 0 ..."
-            )
-            init_start = time.perf_counter()
+        utils.log_rank_zero(
+            log,
+            "Distributed training is enabled. Instantiating model and loading checkpoint on Rank 0 ...",
+        )
+        init_start = time.perf_counter()
 
         with training.set_default_dtype(self._dtype), torch.device("meta"):
             model = config.instantiate(cfg_model)
 
         if self._compile:
             training.compile_model(model, verbose=self._is_rank_zero)
+
+        device_mesh = init_device_mesh(
+            self._device.type,
+            mesh_shape=(self.data_parallel_dim, self.tensor_parallel_dim),
+            mesh_dim_names=("dp", "tp"),
+        )
+        self.dp_size = device_mesh["dp"].size()
+        self.dp_rank = device_mesh["dp"].get_local_rank()
+
+        # Apply tensor parallelism to the model
+        if self.tensor_parallel_dim > 1:
+            # Use the local number (num_heads, num_kv_heads, embed_dim) to account for tensor parallel
+            model = training.prepare_mha_for_tp(model, device_mesh["tp"])
+            parallelize_module(
+                model,
+                device_mesh["tp"],
+                parallelize_plan=self.tensor_parallel_plan,
+            )
 
         # We currently have two versions of activation checkpointing in this recipe
         # for testing and BC purposes. ``enable_activation_checkpointing`` controls
@@ -459,19 +574,21 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                 model, auto_wrap_policy={modules.TransformerSelfAttentionLayer}
             )
 
-        # For FSDP sharding
-        fsdp_shard_conditions = [
-            partial(
-                training.get_shard_conditions,
-                names_to_match=custom_sharded_layers,
+        # Apply Fully Sharded Data Parallelism to the model
+        if self.data_parallel_dim > 1:
+            fsdp_shard_conditions = [
+                partial(
+                    training.get_shard_conditions,
+                    names_to_match=custom_sharded_layers,
+                )
+            ]
+            training.shard_model(
+                model=model,
+                shard_conditions=fsdp_shard_conditions,
+                cpu_offload=fsdp_cpu_offload,
+                reshard_after_forward=reshard_after_forward,
+                dp_mesh=device_mesh["dp"],
             )
-        ]
-        training.shard_model(
-            model=model,
-            shard_conditions=fsdp_shard_conditions,
-            cpu_offload=fsdp_cpu_offload,
-            reshard_after_forward=reshard_after_forward,
-        )
 
         with training.set_default_dtype(self._dtype), self._device:
             for m in model.modules():
@@ -485,7 +602,6 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
             model,
             model_state_dict,
             self._device,
-            self._is_rank_zero,
             strict=True,
             cpu_offload=fsdp_cpu_offload,
         )
@@ -498,10 +614,12 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         # Ensure no params and buffers are on meta device
         training.validate_no_params_on_meta_device(model)
 
+        utils.log_rank_zero(
+            log,
+            f"Instantiating model and loading checkpoint took {time.perf_counter() - init_start:.2f} secs",
+        )
+
         if self._is_rank_zero:
-            log.info(
-                f"Instantiating model and loading checkpoint took {time.perf_counter() - init_start:.2f} secs"
-            )
             memory_stats = training.get_memory_stats(device=self._device)
             training.log_memory_stats(memory_stats)
 
@@ -538,7 +656,8 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                 for param in opt_state_dict.keys():
                     try:
                         training.load_from_full_optimizer_state_dict(
-                            self._optim_ckpt_wrapper.state_dict()[param],
+                            self._model,
+                            self._optim_ckpt_wrapper.optim_map[param],
                             opt_state_dict[param],
                             self._device,
                         )
@@ -547,20 +666,19 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                             "Failed loading in-backward optimizer checkpoints."
                             "Please make sure run being restored from was using in-backward optimizer."
                         ) from e
-            if self._is_rank_zero:
-                log.info("In-backward optimizers are set up.")
+            utils.log_rank_zero(log, "In-backward optimizers are set up.")
             return None
         else:
             optimizer = config.instantiate(cfg_optimizer, self._model.parameters())
             if opt_state_dict:
                 training.load_from_full_optimizer_state_dict(
+                    self._model,
                     optimizer,
                     opt_state_dict,
                     self._device,
                 )
 
-            if self._is_rank_zero:
-                log.info("Optimizer is initialized.")
+            utils.log_rank_zero(log, "Optimizer is initialized.")
             return optimizer
 
     def _setup_data(
@@ -569,21 +687,20 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         shuffle: bool,
         batch_size: int,
         collate_fn: str,
-    ) -> Tuple[DistributedSampler, DataLoader]:
+        dataloader_state_dict: Optional[Dict[str, Any]] = None,
+    ) -> StatefulDataLoader:
         """
-        All data related setup happens here. Currently this recipe only supports the
-        DistributedSamplers with Map-style Datasets which fit into memory. Other samplers,
-        iterable datasets and streaming datasets are not supported.
+        All data related setup happens here. This recipe currently supports only
+        map-style datasets. If a state_dict is provided (meaning we are resuming a training run),
+        it is loaded into the dataloader.
         """
-        world_size, rank = training.get_world_size_and_rank()
-
         if isinstance(cfg_dataset, ListConfig):
             datasets = [
                 config.instantiate(single_cfg_dataset, self._tokenizer)
                 for single_cfg_dataset in cfg_dataset
             ]
             ds = ConcatDataset(datasets=datasets)
-            packed = False
+            packed = getattr(ds, "packed", False)
         else:
             ds = config.instantiate(cfg_dataset, self._tokenizer)
             packed = cfg_dataset.get("packed", False)
@@ -593,15 +710,13 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
             raise RuntimeError("left_pad_sequence collator is only for inference.")
         collate_fn = _get_component_from_path(collate_fn)
 
-        sampler = DistributedSampler(
-            ds, num_replicas=world_size, rank=rank, shuffle=shuffle, seed=0
+        sampler = StatefulDistributedSampler(
+            ds, num_replicas=self.dp_size, rank=self.dp_rank, shuffle=shuffle
         )
-        dataloader = DataLoader(
+        dataloader = StatefulDataLoader(
             dataset=ds,
             batch_size=batch_size,
             sampler=sampler,
-            # dropping last avoids shape issues with compile + flex attention
-            drop_last=True,
             collate_fn=(
                 partial(
                     collate_fn,
@@ -611,102 +726,15 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                 if not packed
                 else padded_collate_packed
             ),
+            # dropping last avoids shape issues with compile + flex attention
+            drop_last=True,
         )
-
-        if self._is_rank_zero:
-            log.info("Dataset and Sampler are initialized.")
-
-        return sampler, dataloader
-
-    def save_checkpoint(
-        self,
-        epoch: int,
-    ) -> None:
-        """
-        Checkpoint the state of the recipe. The constructed checkpoint state dict
-        contains the following information:
-        - Model weights with key training.MODEL_KEY
-        - Relevant recipe state if training is not complete
-
-        Checkpointer will save the model weights and recipe state in
-        different checkpoint files. To correctly resume training from an intermediate checkpoint,
-        the model weights and recipe state must be provided.
-        """
-        # final dict passed onto the checkpointer
-        checkpoint_dict = {}
-
-        intermediate_checkpoint = epoch + 1 < self.total_epochs
-
-        if self._is_rank_zero:
-            log.info(
-                "Saving checkpoint. This may take some time. Retrieving full model state dict..."
-            )
-            start = time.perf_counter()
-
-        # To prevent GPU memory from spiking during checkpoint save,
-        # we consolidate the full model and optim state dicts on CPU for rank 0
-        cpu_state_dict = training.gather_cpu_state_dict(
-            self._model.state_dict(),
-            self._is_rank_zero,
-            device=self._device,
-        )
-
-        if self._is_rank_zero:
-            log.info(
-                f"Getting full model state dict took {time.perf_counter() - start:.2f} secs"
-            )
-
-        if intermediate_checkpoint:
-            start = time.perf_counter()
-            if self._is_rank_zero:
-                log.info("Getting optimizer state dict...")
-            if not self._optimizer_in_bwd:
-                opt_state_dict = training.get_full_optimizer_state_dict(
-                    self._optimizer,
-                    self._is_rank_zero,
-                    device=self._device,
-                )
-            else:
-                opt_state_dict = {}
-                for param, opt in self._optim_ckpt_wrapper.optim_map.items():
-                    opt_state_dict[param] = training.get_full_optimizer_state_dict(
-                        opt, self._is_rank_zero, device=self._device
-                    )
-            if self._is_rank_zero:
-                log.info(
-                    f"Getting optimizer state dict took {time.perf_counter() - start:.2f} secs"
-                )
-        else:
-            opt_state_dict = None
-
-        # Now that we have the model and opt state dict, create the actual checkpoint dict
-        # to be sent to the checkpointer and ultimately written to file
-
-        if self._is_rank_zero:
-            start = time.perf_counter()
-            checkpoint_dict.update({training.MODEL_KEY: cpu_state_dict})
-
-            # if training is in-progress, checkpoint the optimizer state and recipe state
-            # as well.
-            if intermediate_checkpoint:
-                checkpoint_dict.update(
-                    {
-                        training.OPT_KEY: opt_state_dict,
-                        training.SEED_KEY: self.seed,
-                        training.EPOCHS_KEY: self.epochs_run,
-                        training.TOTAL_EPOCHS_KEY: self.total_epochs,
-                        training.MAX_STEPS_KEY: self.max_steps_per_epoch,
-                    }
-                )
-
-            self._checkpointer.save_checkpoint(
-                checkpoint_dict,
-                epoch=epoch,
-                intermediate_checkpoint=intermediate_checkpoint,
-            )
-            log.info(f"Saving checkpoint took {time.perf_counter() - start:.2f} secs")
-
-        torch.distributed.barrier()
+        if dataloader_state_dict is not None:
+            dataloader.load_state_dict(dataloader_state_dict)
+            # B/c we currently only save at epoch boundaries, if we cut the previous epoch short
+            # we need to force the dataloader to finish the last iteration before it's actually used
+            list(dataloader)
+        return dataloader
 
     def train(self) -> None:
         """
@@ -714,8 +742,6 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         """
         # clean up before training begins
         training.cleanup_before_training()
-
-        world_size, rank = training.get_world_size_and_rank()
 
         # zero out the gradients before starting training
         if not self._optimizer_in_bwd:
@@ -732,28 +758,18 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         self._profiler.start()
         # self.epochs_run should be non-zero when we're resuming from a checkpoint
         for curr_epoch in range(self.epochs_run, self.total_epochs):
-            # Update the sampler to ensure data is correctly shuffled across epochs
-            # in case shuffle is True
-            self._sampler.set_epoch(curr_epoch)
-
-            pbar = tqdm(total=self._steps_per_epoch, disable=not (rank == 0))
+            pbar = tqdm(total=self._steps_per_epoch, disable=not self._is_rank_zero)
+            self._dataloader.sampler.set_epoch(curr_epoch)
             for idx, batch in enumerate(self._dataloader):
-                if (
-                    self.max_steps_per_epoch is not None
-                    and (idx // self._gradient_accumulation_steps)
-                    == self.max_steps_per_epoch
-                ):
-                    break
-
                 # Start tracking CUDA memory for active steps for just the first epoch
                 if (
                     self._is_rank_zero
                     and curr_epoch == 0
                     and self.profiler_profile_memory
                     and idx == self.profiler_wait_steps + self.profiler_warmup_steps
+                    and self._device.type == "cuda"
                 ):
                     torch.cuda.memory._record_memory_history()
-
                 utils.batch_to_device(batch, self._device)
 
                 # Calculate the number of unmasked tokens in the current batch
@@ -794,7 +810,9 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                 if self._optimizer_in_bwd:
                     torch.distributed.all_reduce(num_tokens)
                     torch.distributed.all_reduce(running_loss)
-                    current_loss = current_loss / num_tokens
+
+                    # We multiply by world_size to undo FSDP2 gradient normalization.
+                    current_loss = current_loss * (self.world_size / num_tokens)
 
                 current_loss.backward()
 
@@ -806,17 +824,25 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                         # This will ensure that the logged loss matches what we're optimizing
                         torch.distributed.all_reduce(running_loss)
                         # Manually scale the gradients from unnormalized loss by total # of tokens
-                        training.scale_grads(self._model, 1 / num_tokens)
+                        # We multiply by world_size to undo FSDP2 gradient normalization.
+                        training.scale_grads(self._model, self.world_size / num_tokens)
                         if self._clip_grad_norm is not None:
                             grad_norm = torch.nn.utils.clip_grad_norm_(
                                 self._model.parameters(),
                                 max_norm=float(self._clip_grad_norm),
                             )
+                            # If sharded, collect the DTensor here
+                            if isinstance(grad_norm, DTensor):
+                                grad_norm = grad_norm.full_tensor()
                         self._optimizer.step()
                         self._optimizer.zero_grad(set_to_none=True)
 
                     # Update the number of steps when the weights are updated
                     self.global_step += 1
+
+                    # Step the learning rate scheduler
+                    if self._lr_scheduler is not None:
+                        self._lr_scheduler.step()
 
                     loss_to_log = running_loss.item() / num_tokens
                     pbar.update(1)
@@ -840,7 +866,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                                 ),
                             ),
                             "tokens_per_second_per_gpu": num_tokens
-                            / (time_per_step * world_size),
+                            / (time_per_step * self.world_size),
                         }
                         if self._log_peak_memory_stats:
                             log_dict.update(
@@ -867,6 +893,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                         == self.profiler_wait_steps
                         + self.profiler_warmup_steps
                         + self.profiler_active_steps
+                        and self._device.type == "cuda"
                     ):
                         torch.cuda.memory._record_memory_history(enabled=None)
 
@@ -875,8 +902,28 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                     # will include multiple forward / backward passes if gradient accumulation > 1
                     self._profiler.step()
 
+                if (
+                    (idx + 1) // self._gradient_accumulation_steps
+                ) == self.max_steps_per_epoch:
+                    break
+
             self.epochs_run += 1
-            self.save_checkpoint(epoch=curr_epoch)
+            self._checkpoint_client.save_checkpoint(
+                model=self._model,
+                optimizer=(
+                    self._optimizer
+                    if not self._optimizer_in_bwd
+                    else self._optim_ckpt_wrapper
+                ),
+                training_progress=TrainingProgress(
+                    seed=self.seed,
+                    epochs_run=self.epochs_run,
+                    total_epochs=self.total_epochs,
+                    max_steps_per_epoch=self.max_steps_per_epoch,
+                    dataloader_state_dict=self._dataloader.state_dict(),
+                ),
+                epoch=curr_epoch,
+            )
 
         self._profiler.stop()
 
@@ -895,19 +942,7 @@ def recipe_main(cfg: DictConfig) -> None:
         - Parameters specified in config (see available configs through ``tune ls``)
         - Overwritten by arguments from the command-line
     """
-    if not training.is_distributed():
-        raise RuntimeError(
-            "Distributed finetune recipe should be run via a distributed launcher."
-            "If using tune CLI, please specify --nnodes 1 and --nproc_per_node [num_gpus]"
-        )
-    init_process_group(backend="gloo" if cfg.device == "cpu" else "nccl")
-    if cfg.get("fsdp_cpu_offload", False):
-        # Utilize all available CPU cores for intra-op parallelism. This provides ~2x
-        # speed up when benchmarking fused AdamW on CPU
-        training.set_torch_num_threads()
-
     config.log_config(recipe_name="FullFinetuneRecipeDistributed", cfg=cfg)
-
     recipe = FullFinetuneRecipeDistributed(cfg=cfg)
     recipe.setup(cfg=cfg)
     recipe.train()

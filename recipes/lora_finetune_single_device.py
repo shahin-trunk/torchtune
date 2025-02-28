@@ -8,7 +8,7 @@ import sys
 import time
 
 from functools import partial
-from typing import Any, Dict, Optional, Tuple, Union
+from typing import Any, Dict, Optional, Union
 from warnings import warn
 
 import torch
@@ -17,7 +17,7 @@ from omegaconf import DictConfig, ListConfig
 
 from torch import nn
 from torch.optim import Optimizer
-from torch.utils.data import DataLoader, DistributedSampler
+from torchdata.stateful_dataloader import StatefulDataLoader
 from torchtune import config, modules, training, utils
 from torchtune.config._utils import _get_component_from_path
 from torchtune.data import padded_collate_packed
@@ -27,7 +27,6 @@ from torchtune.modules.peft import (
     get_adapter_state_dict,
     get_lora_module_names,
     get_merged_lora_ckpt,
-    load_dora_magnitudes,
     set_trainable_params,
     validate_missing_and_unexpected_for_lora,
 )
@@ -137,15 +136,17 @@ class LoRAFinetuneRecipeSingleDevice(FTRecipeInterface):
         self._log_every_n_steps = cfg.get("log_every_n_steps", 1)
         self._log_peak_memory_stats = cfg.get("log_peak_memory_stats", False)
 
-        if self._log_peak_memory_stats and self._device.type != "cuda":
+        if self._log_peak_memory_stats and self._device.type == "cpu":
             log.info(
-                "log_peak_memory_stats was set to True, however, training does not use cuda. Setting log_peak_memory_stats=False."
+                "log_peak_memory_stats was set to True, however, training uses cpu. Setting log_peak_memory_stats=False."
             )
             self._log_peak_memory_stats = False
 
         # These are public properties which are updated by the checkpoint loader
         # when ``resume_from_checkpoint`` is `True` or validated in tests
-        self.seed = training.set_seed(seed=cfg.seed)
+        self.seed = training.set_seed(
+            seed=cfg.seed, debug_mode=cfg.get("cudnn_deterministic_mode", None)
+        )
         self.epochs_run = 0
         self.total_epochs = cfg.epochs
         self.max_steps_per_epoch = cfg.max_steps_per_epoch
@@ -189,7 +190,7 @@ class LoRAFinetuneRecipeSingleDevice(FTRecipeInterface):
         """
         self._checkpointer = config.instantiate(
             cfg_checkpointer,
-            resume_from_checkpoint=self._resume_from_checkpoint,
+            should_load_recipe_state=self._resume_from_checkpoint,
         )
         checkpoint_dict = self._checkpointer.load_checkpoint()
 
@@ -304,11 +305,16 @@ class LoRAFinetuneRecipeSingleDevice(FTRecipeInterface):
         # Dataloader depends on the tokenizer and loss_fn and should be
         # setup after all of these are setup
         collate_name = cfg.get("collate_fn", "torchtune.data.padded_collate_sft")
-        self._sampler, self._dataloader = self._setup_data(
+        self._dataloader = self._setup_data(
             cfg_dataset=cfg.dataset,
             shuffle=cfg.shuffle,
             batch_size=cfg.batch_size,
             collate_fn=collate_name,
+            dataloader_state_dict=(
+                checkpoint_dict[training.DATALOADER_KEY]
+                if self._resume_from_checkpoint
+                else None
+            ),
         )
 
         # Finally update the recipe state which can only be correctly set after all of the
@@ -450,13 +456,13 @@ class LoRAFinetuneRecipeSingleDevice(FTRecipeInterface):
             for m in model.modules():
                 if hasattr(m, "initialize_dora_magnitude"):
                     m.initialize_dora_magnitude()
-            load_dora_magnitudes(model)
         if lora_weights_state_dict:
             lora_missing, lora_unexpected = model.load_state_dict(
                 lora_weights_state_dict, strict=False
             )
         else:
             lora_missing, lora_unexpected = None, None
+
         validate_missing_and_unexpected_for_lora(
             lora_attn_modules=self._lora_attn_modules,
             apply_lora_to_mlp=self._apply_lora_to_mlp,
@@ -517,11 +523,12 @@ class LoRAFinetuneRecipeSingleDevice(FTRecipeInterface):
         shuffle: bool,
         batch_size: int,
         collate_fn: str,
-    ) -> Tuple[DistributedSampler, DataLoader]:
+        dataloader_state_dict: Optional[Dict[str, Any]] = None,
+    ) -> StatefulDataLoader:
         """
-        All data related setup happens here. Currently this recipe only supports
-        Map-style Datasets which fit into memory and an option for random shuffling.
-        Samplers, iterable datasets, and streaming datasets are not supported.
+        All data related setup happens here. This recipe currently supports only
+        map-style datasets. If a state_dict is provided (meaning we are resuming a training run),
+        it is loaded into the dataloader.
         """
         if isinstance(cfg_dataset, ListConfig):
             datasets = [
@@ -529,7 +536,7 @@ class LoRAFinetuneRecipeSingleDevice(FTRecipeInterface):
                 for single_cfg_dataset in cfg_dataset
             ]
             ds = ConcatDataset(datasets=datasets)
-            packed = False
+            packed = getattr(ds, "packed", False)
         else:
             ds = config.instantiate(cfg_dataset, self._tokenizer)
             packed = cfg_dataset.get("packed", False)
@@ -539,19 +546,10 @@ class LoRAFinetuneRecipeSingleDevice(FTRecipeInterface):
             raise RuntimeError("left_pad_sequence collator is only for inference.")
         collate_fn = _get_component_from_path(collate_fn)
 
-        sampler = DistributedSampler(
-            ds,
-            num_replicas=1,
-            rank=0,
-            shuffle=shuffle,
-            seed=0,
-        )
-        dataloader = DataLoader(
+        dataloader = StatefulDataLoader(
             dataset=ds,
-            sampler=sampler,
+            shuffle=shuffle,
             batch_size=batch_size,
-            # dropping last avoids shape issues with compile + flex attention
-            drop_last=True,
             collate_fn=(
                 partial(
                     collate_fn,
@@ -561,11 +559,15 @@ class LoRAFinetuneRecipeSingleDevice(FTRecipeInterface):
                 if not packed
                 else padded_collate_packed
             ),
+            # dropping last avoids shape issues with compile + flex attention
+            drop_last=True,
         )
-
-        log.info("Dataset and Sampler are initialized.")
-
-        return sampler, dataloader
+        if dataloader_state_dict is not None:
+            dataloader.load_state_dict(dataloader_state_dict)
+            # B/c we currently only save at epoch boundaries, if we cut the previous epoch short
+            # we need to force the dataloader to finish the last iteration before it's actually used
+            list(dataloader)
+        return dataloader
 
     def save_checkpoint(self, epoch: int) -> None:
         """
@@ -590,6 +592,7 @@ class LoRAFinetuneRecipeSingleDevice(FTRecipeInterface):
                     training.EPOCHS_KEY: self.epochs_run,
                     training.TOTAL_EPOCHS_KEY: self.total_epochs,
                     training.MAX_STEPS_KEY: self.max_steps_per_epoch,
+                    training.DATALOADER_KEY: self._dataloader.state_dict(),
                 }
             )
 
@@ -671,24 +674,14 @@ class LoRAFinetuneRecipeSingleDevice(FTRecipeInterface):
         with self._profiler as prof:
             # self.epochs_run should be non-zero when we're resuming from a checkpoint
             for curr_epoch in range(self.epochs_run, self.total_epochs):
-                # Update the sampler to ensure data is correctly shuffled across epochs
-                # in case shuffle is True
-                self._sampler.set_epoch(curr_epoch)
-
                 pbar = tqdm(total=self._steps_per_epoch)
                 for idx, batch in enumerate(self._dataloader):
-                    if (
-                        self.max_steps_per_epoch is not None
-                        and (idx // self._gradient_accumulation_steps)
-                        == self.max_steps_per_epoch
-                    ):
-                        break
-
                     # Start tracking CUDA memory for active steps for just the first epoch
                     if (
                         curr_epoch == 0
                         and self.profiler_profile_memory
                         and idx == self.profiler_wait_steps + self.profiler_warmup_steps
+                        and self._device.type == "cuda"
                     ):
                         torch.cuda.memory._record_memory_history()
 
@@ -736,7 +729,7 @@ class LoRAFinetuneRecipeSingleDevice(FTRecipeInterface):
                                 "tokens_per_second_per_gpu": num_tokens / time_per_step,
                             }
                             if (
-                                self._device.type == "cuda"
+                                self._device.type != "cpu"
                                 and self._log_peak_memory_stats
                             ):
                                 log_dict.update(
@@ -762,6 +755,7 @@ class LoRAFinetuneRecipeSingleDevice(FTRecipeInterface):
                         == self.profiler_wait_steps
                         + self.profiler_warmup_steps
                         + self.profiler_active_steps
+                        and self._device.type == "cuda"
                     ):
                         torch.cuda.memory._record_memory_history(enabled=None)
 
@@ -769,6 +763,11 @@ class LoRAFinetuneRecipeSingleDevice(FTRecipeInterface):
                     # Note we are stepping each batch, which might not include optimizer step in the trace
                     # if the schedule cycle doesn't align with gradient accumulation.
                     prof.step()
+
+                    if (
+                        (idx + 1) // self._gradient_accumulation_steps
+                    ) == self.max_steps_per_epoch:
+                        break
 
                 self.epochs_run += 1
                 start_save_checkpoint = time.perf_counter()

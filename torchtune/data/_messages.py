@@ -16,15 +16,17 @@ Role = Literal[
     "user",  # Origin is user
     "assistant",  # Origin is the model output
     "ipython",  # Origin is return from a tool call
+    "tool",  # Origin is return from a tool call
 ]
 
 
 class Message:
     """
     This class represents individual messages in a fine-tuning dataset. It supports
-    text-only content, text with interleaved images, and tool calls. The :class:`~torchtune.modules.tokenizers.ModelTokenizer`
-    will tokenize the content of the message using ``tokenize_messages`` and attach
-    the appropriate special tokens based on the flags set in this class.
+    text-only content, text with interleaved images, and tool calls. The
+    :class:`~torchtune.modules.transforms.tokenizers.ModelTokenizer` will tokenize
+    the content of the message using ``tokenize_messages`` and attach the appropriate
+    special tokens based on the flags set in this class.
 
     Args:
         role (Role): role of the message writer. Can be "system" for system prompts,
@@ -168,8 +170,10 @@ class InputOutputToMessages(Transform):
             on a remote url. For text-only, leave as None. Default is None.
 
     Raises:
-        ValueError: If ``column_map`` is provided and ``input`` not in ``column_map``, or
-            ``output`` not in ``column_map``.
+        ValueError:
+            If ``column_map`` is provided and ``input`` not in ``column_map``, or
+                ``output`` not in ``column_map``, **or**
+            if ``image_dir`` is provided but ``image`` not in ``column_map``.
     """
 
     def __init__(
@@ -196,6 +200,14 @@ class InputOutputToMessages(Transform):
         else:
             self.column_map = {"input": "input", "output": "output", "image": "image"}
 
+        # Ensure that if a user seems to want to construct a multimodal transform, they provide
+        # a proper column_mapping
+        if "image" not in self.column_map.keys() and image_dir is not None:
+            raise ValueError(
+                f"image_dir is specified as {image_dir} but 'image' is not in column_map. "
+                "Please specify an 'image' key in column_map."
+            )
+
         self.image_dir = image_dir
 
     def __call__(self, sample: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -206,8 +218,13 @@ class InputOutputToMessages(Transform):
         if is_multimodal:
             image_path = sample[self.column_map["image"]]
             if isinstance(image_path, str):
+                # Convert image_path to Path obj
+                image_path = Path(image_path)
+
+                # If image_dir is not None, prepend image_dir to image_path
                 if self.image_dir is not None:
                     image_path = self.image_dir / image_path
+
                 # Load if not loaded
                 pil_image = load_image(image_path)
             else:
@@ -596,7 +613,8 @@ class OpenAIToMessages(Transform):
                     role="system", content=self.new_system_prompt, masked=True, eot=True
                 )
             )
-        for message in sample[self._column_map["messages"]]:
+        messages = sample[self._column_map["messages"]]
+        for i, message in enumerate(messages):
             if message["role"] == "system" and self.new_system_prompt is not None:
                 continue
             masked = (message["role"] != "assistant") and (not self.train_on_input)
@@ -604,11 +622,25 @@ class OpenAIToMessages(Transform):
                 content = self._convert_from_openai_content(message["content"])
             elif isinstance(message["content"], str):
                 content = message["content"]
+
+            eot = True
+            if message["role"] in ["tool", "ipython"]:
+                # After tool responses, turn is not over, because assistant will interpret the tool response.
+                eot = False
+            elif message["role"] == "assistant":
+                # If the next message is a tool response instead of a user message
+                # the current assistant message is not the end of the turn.
+                # Models like Llama will append EOM to the end of the assistant message for tool calls.
+                has_next_message = i < len(messages) - 1
+                if has_next_message and messages[i + 1]["role"] in ["tool", "ipython"]:
+                    eot = False
+
             updated_messages.append(
                 Message(
                     role=message["role"],
                     content=content,
                     masked=masked,
+                    eot=eot,
                 ),
             )
 
@@ -640,13 +672,17 @@ def validate_messages(
             f"Messages must be at least length 2, but got {len(messages)} messages"
         )
 
-    last_turn = "assistant"
+    last_message = Message(role="assistant", content="")
     for i, message in enumerate(messages):
-        if message.role == "assistant" and last_turn != "user":
+        if message.role == "assistant" and last_message.role not in [
+            "user",
+            "tool",
+            "ipython",
+        ]:
             raise ValueError(
-                f"Assistant message before expected user message at index {i} in messages"
+                f"Assistant message before expected user, tool or ipython message at index {i} in messages"
             )
-        if message.role == "user" and last_turn == "user":
+        if message.role == "user" and last_message.role == "user":
             raise ValueError(
                 f"Two consecutive user messages at index {i} and {i - 1} in messages"
             )
@@ -654,7 +690,11 @@ def validate_messages(
             raise ValueError(
                 f"System message at index {i} in messages, but system messages must come first"
             )
-        last_turn = message.role
+        if message.role in ["tool", "ipython"] and not last_message.ipython:
+            raise ValueError(
+                f"Tool or ipython message at index {i} must follow an ipython message"
+            )
+        last_message = message
 
 
 class AlpacaToMessages(Transform):

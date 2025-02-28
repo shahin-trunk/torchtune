@@ -31,8 +31,8 @@ from torchtune.generation import generate, sample
 from torchtune.modules import TransformerDecoder
 from torchtune.modules.common_utils import local_kv_cache
 from torchtune.modules.model_fusion import DeepFusionModel
-from torchtune.modules.tokenizers import ModelTokenizer
 from torchtune.modules.transforms import Transform
+from torchtune.modules.transforms.tokenizers import ModelTokenizer
 from torchtune.recipe_interfaces import EvalRecipeInterface
 from torchtune.training import FullModelTorchTuneCheckpointer
 
@@ -441,17 +441,19 @@ class EleutherEvalRecipe(EvalRecipeInterface):
         # Double check we have the right Eval Harness version
         from importlib.metadata import version
 
-        if version("lm-eval") != "0.4.5":
+        if version("lm-eval") < "0.4.5":
             raise RuntimeError(
-                "This recipe requires EleutherAI Eval Harness v0.4.5. "
-                "Please install with `pip install lm-eval==0.4.5`"
+                "This recipe requires EleutherAI Eval Harness v0.4.5 or higher. "
+                "Please install with `pip install lm-eval>=0.4.5`"
             )
 
         # General variable initialization
         self.device = utils.get_device(device=cfg.device)
         self.dtype = training.get_dtype(dtype=cfg.dtype, device=self.device)
         self.logger = utils.get_logger(cfg.get("log_level", "info"))
-        training.set_seed(seed=cfg.seed)
+        training.set_seed(
+            seed=cfg.seed, debug_mode=cfg.get("cudnn_deterministic_mode", None)
+        )
 
         # Eval specific variables
         self.limit = cfg.limit
@@ -547,9 +549,11 @@ class EleutherEvalRecipe(EvalRecipeInterface):
 
         # Log metrics
         self.logger.info(f"Eval completed in {t1:.02f} seconds.")
-        self.logger.info(
-            f"Max memory allocated: {torch.cuda.max_memory_allocated() / 1e9:.02f} GB"
-        )
+        if self.device.type != "cpu":
+            torch_device = utils.get_torch_device_namespace()
+            self.logger.info(
+                f"Max memory allocated: {torch_device.max_memory_allocated() / 1e9:.02f} GB"
+            )
         formatted_output = make_table(output)
         self.logger.info(f"\n\n{formatted_output}\n")
 
